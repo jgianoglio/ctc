@@ -3,7 +3,7 @@
 """
 Created on Sun Apr  8 13:26:40 2018
 
-@author: Jim
+@author: Jim Gianoglio
 """
 
 import argparse
