@@ -3,23 +3,27 @@
 """
 Created on Sun Apr  8 13:26:40 2018
 
-@author: Jim Gianoglio aka Gator
+@author: Jim Gianoglio
 """
 
 import argparse
+import csv
 import os
 import sys
+import time
 
 import numpy as np
 import torch
-from inferno.extensions.metrics.categorical import CategoricalError
 from inferno.trainers.basic import Trainer
 from inferno.trainers.callbacks.base import Callback
+from inferno.trainers.callbacks.logging.tensorboard import TensorboardLogger
 from torch import nn
 from torch.autograd import Variable
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data.dataset import TensorDataset
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.dataloader import _use_shared_memory
 
+INPUT_DIM = 40
+OUTPUT_DIM = 47
 
 def batchify(array, args):
     batch_len = args.batch_len
@@ -55,16 +59,15 @@ class WsjDataset(Dataset):
         if test:
             labels = [np.zeros((d[1].shape[0],), dtype=np.int32) for d in data]
         else:
-            labels = np.load(os.path.join(args.data_directory, '{}-phonemes.npy'.format(name)))
+            labels = np.load(os.path.join(args.data_directory, '{}_phonemes.npy'.format(name)))
 
         # preprocessing
         self.features = [torch.from_numpy(x[0].T) for x in data]
-        self.assignments = [torch.from_numpy(assignment_vector(x)).long() for x in data]
         self.phonemes = [torch.from_numpy(y).long() for y in labels]
         self.len = len(self.features)
 
     def __getitem__(self, item):
-        return self.features[item], self.assignments[item], self.phonemes[item]
+        return self.features[item], self.phonemes[item]
 
     def __len__(self):
         return self.len
@@ -88,36 +91,32 @@ def wsj_collate_fn(batch):
         collated_frames = batch[0][0].new(frame_store).resize_(1, INPUT_DIM, frame_total).zero_()
         phoneme_store = batch[0][1].storage()._new_shared(phoneme_total)
         collated_phonemes = batch[0][1].new(phoneme_store).resize_(phoneme_total).zero_()
-        assignment_store = batch[0][1].storage()._new_shared(frame_total)
-        collated_assignments = batch[0][1].new(assignment_store).resize_(frame_total).zero_()
     else:
         collated_frames = batch[0][0].new(1, INPUT_DIM, frame_total).zero_()
         collated_phonemes = batch[0][1].new(phoneme_total).zero_()
-        collated_assignments = batch[0][1].new(frame_total).zero_()
     # Collate
     framepos = 0
     phonemepos = 0
-    for f, a, p in batch:
+    for f, p in batch:
         startframe = framepos + padding
         endframe = framepos + padding + f.size(1)
         collated_frames[0, :, startframe:endframe] = f
-        collated_assignments[startframe:endframe] = a + phonemepos + 1
         collated_phonemes[phonemepos:phonemepos + p.size(0)] = p
         framepos += 2 * padding + f.size(1)
         phonemepos += p.size(0)
 
     # Return
-    return collated_frames, collated_assignments, collated_phonemes
+    return collated_frames, collated_phonemes
 
 
 class WsjModel(nn.Module):
     def __init__(self, args):
         super(WsjModel, self).__init__()
         self.rnns = nn.ModuleList([
-            nn.LSTM(input_size=args.embedding_dim, hidden_size=args.hidden_dim, batch_first=True),
             nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim, batch_first=True),
-            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.embedding_dim, batch_first=True)])
-        self.projection = nn.Linear(in_features=args.embedding_dim, out_features=47)
+            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim, batch_first=True),
+            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim, batch_first=True)])
+        self.projection = nn.Linear(in_features=args.hidden_dim, out_features=47)
 
     def forward(self, features):
         # Model
@@ -151,6 +150,29 @@ def print_generated(lines):
         print("Generated text {}: {}".format(i, line))
 
 
+class EpochTimer(Callback):
+    """
+    Callback that prints the elapsed time per epoch
+    """
+
+    def __init__(self):
+        super(EpochTimer, self).__init__()
+        self.start_time = None
+
+    def begin_of_training_run(self, **_kwargs):
+        self.start_time = time.time()
+
+    def begin_of_epoch(self, **_kwargs):
+        self.start_time = time.time()
+
+    def end_of_epoch(self, epoch_count, **_kwargs):
+        assert self.start_time is not None
+        end_time = time.time()
+        elapsed = end_time - self.start_time
+        print("Epoch {} elapsed: {}".format(epoch_count, elapsed))
+        self.start_time = None
+
+
 def train_model(args):
     """
     Performs the training
@@ -182,7 +204,7 @@ def train_model(args):
     # Bind loaders
     trainer.bind_loader('train', train_loader, num_inputs=2)
     trainer.bind_loader('validate', validate_loader, num_inputs=2)
-    trainer.register_callback(EpochTimer())
+    trainer.register_callback( EpochTimer())
     if args.cuda:
         trainer.cuda()
 
@@ -196,9 +218,9 @@ def main(argv):
     parser = argparse.ArgumentParser(description='Homework 2 Part 2 Baseline')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='input batch size')
     parser.add_argument('--save-directory', type=str, default='output/simple/v1', help='output directory')
-    parser.add_argument('--data-directory', type=str, default='../', help='data directory')
+    parser.add_argument('--data-directory', type=str, default='', help='data directory')
     parser.add_argument('--epochs', type=int, default=5, metavar='N', help='number of epochs to train')
-    parser.add_argument('--hidden', type=int, default=256, metavar='N', help='hidden units')
+    parser.add_argument('--hidden_dim', type=int, default=256, metavar='N', help='hidden units')
     parser.add_argument('--num-workers', type=int, default=0, metavar='N', help='number of workers')
     parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
 
