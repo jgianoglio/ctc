@@ -82,7 +82,7 @@ def wsj_collate_fn(batch):
     n = len(batch)
     frame_total = padding * 2 * n
     phoneme_total = 0
-    for f, a, p in batch:
+    for f, p in batch:
         frame_total += f.size(1)
         phoneme_total += p.size(0)
     # Allocate storage
@@ -197,9 +197,9 @@ def train_model(args):
         .save_every((1, 'epochs')) \
         .save_to_directory(args.save_directory) \
         .set_max_num_epochs(args.epochs) \
-        .build_logger(TensorboardLogger(log_scalars_every=(1, 'iteration'),
-                                        log_images_every='never'),
-                      log_directory=args.save_directory)
+        #.build_logger(TensorboardLogger(log_scalars_every=(1, 'iteration'),
+                                        #log_images_every='never'),
+                      #log_directory=args.save_directory)
 
     # Bind loaders
     trainer.bind_loader('train', train_loader, num_inputs=2)
