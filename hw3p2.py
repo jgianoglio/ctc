@@ -11,6 +11,7 @@ import csv
 import os
 import sys
 import time
+from operator import itemgetter
 
 import numpy as np
 import torch
@@ -62,7 +63,8 @@ class WsjDataset(Dataset):
             labels = np.load(os.path.join(args.data_directory, '{}_phonemes.npy'.format(name)))
 
         # preprocessing
-        self.features = [torch.from_numpy(x[0].T) for x in data]
+        #self.features = [torch.from_numpy(x.T) for x in data]
+        self.features = [torch.from_numpy(x) for x in data]
         self.phonemes = [torch.from_numpy(y).long() for y in labels]
         self.len = len(self.features)
 
@@ -72,38 +74,56 @@ class WsjDataset(Dataset):
     def __len__(self):
         return self.len
 
+def getKey(item):
+    return item[0].size()[0]
 
 def wsj_collate_fn(batch):
     """
-    Concatenate features, assignments and labels
+    Concatenate features and labels
+
+    - Sort the batch by the # of frames in each utterance in decending order. Should have 32 utterances (i.e. batch size)
+    - Create a tensor of zeros the size of (max Utt. Len X batch size)
+
     """
-    padding = 40  # padding between utterances
     # Count totals
-    n = len(batch)
-    frame_total = padding * 2 * n
+    batch_size = len(batch)  # Should be 32
+
+    # Sort the batch in descending order by length of utterance
+    sorted_batch = sorted(batch, key=getKey, reverse=True)
+
+    max_length = sorted_batch[0][0].size()[0]
     phoneme_total = 0
     for f, p in batch:
-        frame_total += f.size(1)
+        #frame_total += f.size(1)
         phoneme_total += p.size(0)
     # Allocate storage
     if _use_shared_memory:
-        frame_store = batch[0][0].storage()._new_shared(INPUT_DIM * frame_total)
-        collated_frames = batch[0][0].new(frame_store).resize_(1, INPUT_DIM, frame_total).zero_()
-        phoneme_store = batch[0][1].storage()._new_shared(phoneme_total)
-        collated_phonemes = batch[0][1].new(phoneme_store).resize_(phoneme_total).zero_()
+        frame_store = sorted_batch[0][0].storage()._new_shared(max_length * batch_size * 40)
+        collated_frames = sorted_batch[0][0].new(frame_store).resize_(max_length, batch_size, 40).zero_()
+        phoneme_store = sorted_batch[0][1].storage()._new_shared(phoneme_total)
+        collated_phonemes = sorted_batch[0][1].new(phoneme_store).resize_(phoneme_total).zero_()
+        #numFrame_store = sorted_batch[0][0].storage()._new_shared(batch_size)
+        num_frames = torch.IntTensor(batch_size,).zero_()
+        num_phonemes = torch.IntTensor(batch_size).zero_()
     else:
-        collated_frames = batch[0][0].new(1, INPUT_DIM, frame_total).zero_()
-        collated_phonemes = batch[0][1].new(phoneme_total).zero_()
+        collated_frames = sorted_batch[0][0].new(max_length, batch_size, 40).zero_()
+        collated_phonemes = sorted_batch[0][1].new(phoneme_total).zero_()
+        num_frames = torch.IntTensor(batch_size,).zero_()
+        num_phonemes = torch.IntTensor(batch_size).zero_()
     # Collate
     framepos = 0
     phonemepos = 0
-    for f, p in batch:
-        startframe = framepos + padding
-        endframe = framepos + padding + f.size(1)
-        collated_frames[0, :, startframe:endframe] = f
-        collated_phonemes[phonemepos:phonemepos + p.size(0)] = p
-        framepos += 2 * padding + f.size(1)
-        phonemepos += p.size(0)
+    for counter, f in enumerate(sorted_batch):
+        #startframe = framepos + padding
+        #endframe = framepos + padding + f.size(1)
+        length = f[0].size(0)
+        collated_frames[:length, counter, :] = f[0]
+        num_frames[counter] = length
+        num_phonemes[counter] = f[1].size(0)
+
+        collated_phonemes[phonemepos:phonemepos + f[1].size(0)] = f[1]
+        #framepos += 2 * padding + f.size(1)
+        phonemepos += f[1].size(0)
 
     # Return
     return collated_frames, collated_phonemes
@@ -113,25 +133,39 @@ class WsjModel(nn.Module):
     def __init__(self, args):
         super(WsjModel, self).__init__()
         self.rnns = nn.ModuleList([
-            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim, batch_first=True),
-            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim, batch_first=True),
-            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim, batch_first=True)])
+            nn.LSTM(input_size=INPUT_DIM, hidden_size=args.hidden_dim),
+            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim),
+            nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim)])
         self.projection = nn.Linear(in_features=args.hidden_dim, out_features=47)
 
-    def forward(self, features):
-        # Model
-        h = features
-        for l in self.layers:
-            h = l(h)
-        raw_logits = torch.squeeze(h, 0)
-        # Pooling
-        oh = make_one_hot(assignments.data)
-        sum_logits = torch.mm(raw_logits, oh)  # (46, phonemes)
-        sum_assignment = torch.sum(oh, 0)
-        pooled_logits = sum_logits / sum_assignment
-        pooled_logits = torch.transpose(pooled_logits, 1, 0)  # (phonemes, 46)
-        # Return
-        return pooled_logits
+    def forward(self, input, forward=0, stochastic=False):
+        h = input  # (n, t)
+        #h = self.embedding(h)  # (n, t, c)
+        states = []
+        for rnn in self.rnns:
+            h, state = rnn(h)
+            states.append(state)
+        h = self.projection(h)
+        if stochastic:
+            gumbel = Variable(sample_gumbel(shape=h.size(), out=h.data.new()))
+            h += gumbel
+        logits = h
+        if forward > 0:
+            outputs = []
+            h = torch.max(logits[:, -1:, :], dim=2)[1] + 1
+            for i in range(forward):
+                #h = self.embedding(h)
+                for j, rnn in enumerate(self.rnns):
+                    h, state = rnn(h, states[j])
+                    states[j] = state
+                h = self.projection(h)
+                if stochastic:
+                    gumbel = Variable(sample_gumbel(shape=h.size(), out=h.data.new()))
+                    h += gumbel
+                outputs.append(h)
+                h = torch.max(h, dim=2)[1] + 1
+            logits = torch.cat([logits] + outputs, dim=1)
+        return logits
 
 
 class CustomLogger(Callback):
@@ -202,8 +236,8 @@ def train_model(args):
                       #log_directory=args.save_directory)
 
     # Bind loaders
-    trainer.bind_loader('train', train_loader, num_inputs=2)
-    trainer.bind_loader('validate', validate_loader, num_inputs=2)
+    trainer.bind_loader('train', train_loader, num_inputs=1)
+    trainer.bind_loader('validate', validate_loader, num_inputs=1)
     trainer.register_callback( EpochTimer())
     if args.cuda:
         trainer.cuda()
