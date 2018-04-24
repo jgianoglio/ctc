@@ -126,7 +126,7 @@ def wsj_collate_fn(batch):
         phonemepos += f[1].size(0)
 
     # Return
-    return collated_frames, collated_phonemes
+    return collated_frames, collated_phonemes, num_frames, num_phonemes
 
 
 class WsjModel(nn.Module):
@@ -236,8 +236,8 @@ def train_model(args):
                       #log_directory=args.save_directory)
 
     # Bind loaders
-    trainer.bind_loader('train', train_loader, num_inputs=1)
-    trainer.bind_loader('validate', validate_loader, num_inputs=1)
+    trainer.bind_loader('train', train_loader, num_inputs=3)
+    trainer.bind_loader('validate', validate_loader, num_inputs=3)
     trainer.register_callback( EpochTimer())
     if args.cuda:
         trainer.cuda()
