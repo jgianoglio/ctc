@@ -266,7 +266,7 @@ def main(argv):
     parser = argparse.ArgumentParser(description='Homework 2 Part 2 Baseline')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='input batch size')
     parser.add_argument('--save-directory', type=str, default='output/simple/v1', help='output directory')
-    parser.add_argument('--data-directory', type=str, default='', help='data directory')
+    parser.add_argument('--data-directory', type=str, default='../', help='data directory')
     parser.add_argument('--epochs', type=int, default=5, metavar='N', help='number of epochs to train')
     parser.add_argument('--hidden_dim', type=int, default=256, metavar='N', help='hidden units')
     parser.add_argument('--num-workers', type=int, default=0, metavar='N', help='number of workers')
