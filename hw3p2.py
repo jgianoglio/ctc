@@ -22,6 +22,9 @@ from torch import nn
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.dataloader import _use_shared_memory
+from torch.nn.utils.rnn import pack_padded_sequence
+from torch.nn.utils.rnn import pad_packed_sequence
+from warpctc_pytorch import CTCLoss
 
 INPUT_DIM = 40
 OUTPUT_DIM = 47
@@ -126,7 +129,7 @@ def wsj_collate_fn(batch):
         phonemepos += f[1].size(0)
 
     # Return
-    return collated_frames, collated_phonemes, num_frames, num_phonemes
+    return collated_frames, num_frames, num_phonemes, collated_phonemes
 
 
 class WsjModel(nn.Module):
@@ -138,34 +141,45 @@ class WsjModel(nn.Module):
             nn.LSTM(input_size=args.hidden_dim, hidden_size=args.hidden_dim)])
         self.projection = nn.Linear(in_features=args.hidden_dim, out_features=47)
 
-    def forward(self, input, forward=0, stochastic=False):
+    def forward(self, input, num_frames, num_phonemes):
         h = input  # (n, t)
+        h = pack_padded_sequence(h, num_frames.data.numpy())
         #h = self.embedding(h)  # (n, t, c)
         states = []
         for rnn in self.rnns:
             h, state = rnn(h)
             states.append(state)
+        h, _ = pad_packed_sequence(h)
         h = self.projection(h)
-        if stochastic:
-            gumbel = Variable(sample_gumbel(shape=h.size(), out=h.data.new()))
-            h += gumbel
+        #if stochastic:
+        #    gumbel = Variable(sample_gumbel(shape=h.size(), out=h.data.new()))
+        #    h += gumbel
         logits = h
-        if forward > 0:
-            outputs = []
-            h = torch.max(logits[:, -1:, :], dim=2)[1] + 1
-            for i in range(forward):
-                #h = self.embedding(h)
-                for j, rnn in enumerate(self.rnns):
-                    h, state = rnn(h, states[j])
-                    states[j] = state
-                h = self.projection(h)
-                if stochastic:
-                    gumbel = Variable(sample_gumbel(shape=h.size(), out=h.data.new()))
-                    h += gumbel
-                outputs.append(h)
-                h = torch.max(h, dim=2)[1] + 1
-            logits = torch.cat([logits] + outputs, dim=1)
-        return logits
+
+        return logits, num_frames, num_phonemes
+
+class ctc_loss(CTCLoss):
+    def __init__(self):
+        super(ctc_loss, self).__init__()
+
+    def forward(self, model_output, labels):
+        """
+        acts: Tensor of (seqLength x batch x outputDim) containing output from network
+        labels: 1 dimensional Tensor containing all the targets of the batch in one sequence
+        act_lens: Tensor of size (batch) containing size of each output sequence from the network
+        act_lens: Tensor of (batch) containing label length of each example
+        """
+        labels = labels.cpu().int()
+        acts = model_output[0]
+        act_lens = model_output[1].cpu()
+        label_lens = model_output[2].cpu()
+        #print(model_output)
+        assert len(labels.size()) == 1  # labels must be 1 dimensional
+        #_assert_no_grad(labels)
+        #_assert_no_grad(act_lens)
+        #_assert_no_grad(label_lens)
+        return self.ctc(acts, labels, act_lens, label_lens, self.size_average,
+                        self.length_average)
 
 
 class CustomLogger(Callback):
@@ -224,8 +238,8 @@ def train_model(args):
         batch_size=args.batch_size, collate_fn=wsj_collate_fn, **kwargs)
     # Build trainer
     trainer = Trainer(model) \
-        .build_criterion('CrossEntropyLoss', size_average=False) \
-        .build_metric('CategoricalError') \
+        .build_criterion(ctc_loss()) \
+        .build_metric(ctc_loss()) \
         .build_optimizer('Adam') \
         .validate_every((1, 'epochs')) \
         .save_every((1, 'epochs')) \
